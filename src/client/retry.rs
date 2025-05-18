@@ -332,27 +332,53 @@ impl RetryableRequest {
                 Ok(r) => {
                     let status = r.status();
                     if status.is_success() {
+                        let (parts, body) = r.into_parts();
+                        let body = match body.bytes().await {
+                            Ok(body) => body,
+                            Err(e) => {
+                                if ctx.retries == ctx.max_retries
+                                    || ctx.start.elapsed() > ctx.retry_timeout
+                                {
+                                    return Err(ctx.err(RequestError::Http(e)));
+                                }
+
+                                let sleep = backoff.next();
+                                ctx.retries += 1;
+                                info!(
+                                    "Failed to read response body, backing off for {} seconds, retry {} of {}: {}",
+                                    sleep.as_secs_f32(),
+                                    ctx.retries,
+                                    ctx.max_retries,
+                                    e,
+                                );
+                                tokio::time::sleep(sleep).await;
+                                continue;
+                            }
+                        };
+
                         // For certain S3 requests, 200 response may contain `InternalError` or
                         // `SlowDown` in the message. These responses should be handled similarly
                         // to r5xx errors.
                         // More info here: https://repost.aws/knowledge-center/s3-resolve-200-internalerror
                         if !self.retry_error_body {
-                            return Ok(r);
+                            return Ok(HttpResponse::from_parts(parts, body.into()));
                         }
 
-                        let (parts, body) = r.into_parts();
-                        let body = match body.text().await {
-                            Ok(body) => body,
-                            Err(e) => return Err(ctx.err(RequestError::Http(e))),
+                        let Ok(body_str) = std::str::from_utf8(&body) else {
+                            // The response body cannot contain an error message unless it is a valid string
+                            return Ok(HttpResponse::from_parts(parts, body.into()));
                         };
 
-                        if !body_contains_error(&body) {
+                        if !body_contains_error(&body_str) {
                             // Success response and no error, clone and return response
                             return Ok(HttpResponse::from_parts(parts, body.into()));
                         } else {
                             // Retry as if this was a 5xx response
                             if ctx.exhausted() {
-                                return Err(ctx.err(RequestError::Response { body, status }));
+                                return Err(ctx.err(RequestError::Response {
+                                    body: body_str.to_string(),
+                                    status,
+                                }));
                             }
 
                             let sleep = backoff.next();
